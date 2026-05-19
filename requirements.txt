@@ -1,0 +1,8 @@
+requests>=2.31
+
+# Lokale Transkription (Apple Silicon)
+mlx-whisper>=0.4
+
+# Optional: GCP Service-Account-Authentifizierung
+# (nicht nötig wenn `gcloud auth login` oder GOOGLE_API_KEY verwendet wird)
+google-auth>=2.30

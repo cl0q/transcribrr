@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / Credentials — NICHT committen
+*.json
+!package*.json
+.env
+.env.*
+gcp-credentials.json
+service-account*.json
+
+# Lokale Test-Artefakte
+/tmp/
+*.log
+*.m4a
+*.wav
+*.mp3
+*.flac
