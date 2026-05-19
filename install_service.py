@@ -35,16 +35,21 @@ def gen_uuid() -> str:
     return str(uuid.uuid4()).upper()
 
 
-SHELL_PATH_PREAMBLE = (
-    'export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:'
-    '/usr/bin:/bin:/usr/sbin:/sbin:$PATH"'
-)
+SHELL_PREAMBLE = """export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# API-Keys (TOGETHER_API_KEY, GOOGLE_API_KEY, …) aus zentraler Config laden.
+# Quick Actions sehen ~/.zshrc nicht — daher dieser separate Pfad.
+if [ -f "$HOME/.config/transcribrr.env" ]; then
+    set -a
+    . "$HOME/.config/transcribrr.env"
+    set +a
+fi"""
 
 
 def build_file_shell_script(transcribe_py: Path) -> str:
     """Shell-Script für Datei-Service (input: ausgewählte Audio-Dateien)."""
     return f"""#!/bin/zsh
-{SHELL_PATH_PREAMBLE}
+{SHELL_PREAMBLE}
 
 # Sequentiell, damit mehrere Dateien nicht ums Clipboard kämpfen.
 for f in "$@"; do
@@ -56,7 +61,7 @@ done
 def build_latest_shell_script(helper_py: Path) -> str:
     """Shell-Script für Latest-Voice-Memo-Service (kein Input)."""
     return f"""#!/bin/zsh
-{SHELL_PATH_PREAMBLE}
+{SHELL_PREAMBLE}
 /usr/bin/env python3 "{helper_py}" >/dev/null 2>&1
 """
 
@@ -316,6 +321,11 @@ def install() -> None:
     print("Falls du die Test-Notification NICHT siehst:")
     print("  Systemeinstellungen → Mitteilungen → terminal-notifier (oder Terminal)")
     print("  → Mitteilungen erlauben")
+    print()
+    print("LLM-Polish (optional aber empfohlen):")
+    print("  echo 'TOGETHER_API_KEY=tk-...' >> ~/.config/transcribrr.env")
+    print("  → Transkript wird vor dem Clipboard durch ein LLM aufgeputzt")
+    print("  → Füllwörter raus, offensichtliche Hörfehler korrigiert")
 
 
 def uninstall() -> None:

@@ -39,6 +39,12 @@ LOCAL_THRESHOLD_SECS  = 5 * 60         # < 5 min → lokal
 CONFIDENCE_THRESHOLD  = 0.50           # unter 50% → GCP-Fallback
 WHISPER_MODEL         = "mlx-community/whisper-medium-mlx"
 
+# Polish (LLM-Aufputzen via together.ai)
+TOGETHER_ENDPOINT     = "https://api.together.xyz/v1/chat/completions"
+TOGETHER_CONFIG_PATH  = Path.home() / ".config" / "transcribrr.env"
+DEFAULT_POLISH_MODEL  = "Qwen/Qwen2.5-72B-Instruct-Turbo"
+POLISH_TIMEOUT_SECS   = 60
+
 FREE_TIER_SECONDS     = 60 * 60        # 60 Min/Monat kostenlos (GCP)
 BILLING_INCREMENT     = 15             # Abrechnung in 15s-Schritten
 GCP_PRICES = {
@@ -53,6 +59,80 @@ API_RECOGNIZE = (
     "/projects/{project}/locations/global/recognizers/_:recognize"
 )
 MAX_CHUNK_SECS = 58
+
+# ─── Polish via together.ai (LLM-Aufputzen) ───────────────────────────────────
+
+POLISH_SYSTEM_PROMPT = """Du putzt rohe Transkripte aus Speech-to-Text auf (Whisper / GCP).
+
+Regeln:
+1. Entferne Füllwörter ohne Funktion: äh, ähm, also, halt, weißt du, ne, irgendwie
+2. Korrigiere offensichtliche Hörfehler aus dem Kontext:
+   - "Eiweiß" → "iOS" bei Software-Kontext
+   - vertauschte Eigennamen / Fachbegriffe wenn der Kontext sie ergibt
+3. Setze sinnvolle Satzzeichen und Großschreibung
+4. Behalte:
+   - Sprache (Deutsch bleibt Deutsch, Englisch bleibt Englisch, Code-Switching OK)
+   - Ton und Stil des Sprechers (Du-Form, Umgangssprache)
+   - Fachbegriffe (LLM, API, Repo, etc.)
+5. Erfinde KEINE neuen Informationen
+6. Fasse NICHT zusammen — der Inhalt bleibt vollständig
+7. Behebe abgebrochene Sätze nur wenn klar ist, was gemeint war
+
+AUSGABE: Nur das aufgeputzte Transkript. Keine Einleitung, keine Kommentare,
+kein Markdown, keine Anführungszeichen drumherum."""
+
+
+def load_together_api_key() -> str | None:
+    """API-Key aus Env oder ~/.config/transcribrr.env."""
+    key = os.environ.get("TOGETHER_API_KEY", "").strip()
+    if key:
+        return key
+    if not TOGETHER_CONFIG_PATH.exists():
+        return None
+    for line in TOGETHER_CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if line.startswith("TOGETHER_API_KEY="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if value:
+                return value
+    return None
+
+
+def polish_transcript(
+    text: str,
+    api_key: str,
+    model: str = DEFAULT_POLISH_MODEL,
+    timeout: int = POLISH_TIMEOUT_SECS,
+) -> str:
+    """Schickt Transkript durch together.ai zum Aufputzen. Wirft bei Fehler."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+            {"role": "user",   "content": text},
+        ],
+        "temperature": 0.2,
+        "max_tokens":  min(8192, max(500, len(text) // 2 + 200)),
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+    resp = requests.post(TOGETHER_ENDPOINT, headers=headers,
+                         json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    polished = data["choices"][0]["message"]["content"].strip()
+    # Modelle wrappen manchmal mit Anführungszeichen
+    if (polished.startswith('"') and polished.endswith('"')) or \
+       (polished.startswith("'") and polished.endswith("'")):
+        polished = polished[1:-1].strip()
+    return polished
+
 
 # ─── UI-Hilfsfunktionen ───────────────────────────────────────────────────────
 
@@ -542,6 +622,13 @@ def main() -> None:
                         help="Nur transkribierten Text ausgeben")
     parser.add_argument("--notify", action="store_true",
                         help="macOS-Benachrichtigungen anzeigen (Start, Fallback, Ende)")
+    parser.add_argument("--no-polish", action="store_true",
+                        help="Transkript NICHT durch together.ai aufputzen "
+                             "(Default: aufputzen wenn TOGETHER_API_KEY oder "
+                             f"{TOGETHER_CONFIG_PATH} vorhanden)")
+    parser.add_argument("--polish-model", default=DEFAULT_POLISH_MODEL,
+                        metavar="MODEL",
+                        help=f"together.ai-Modell für Polish (Default: {DEFAULT_POLISH_MODEL})")
     args = parser.parse_args()
 
     global _NOTIFY_ENABLED
@@ -670,8 +757,43 @@ def main() -> None:
             result["work_duration"] = work_duration
             result["removed_secs"]  = duration - work_duration
 
+        # ── Polish (LLM-Aufputzen via together.ai) ────────────────────
+        raw_text  = result["text"]
+        full_text = raw_text
+        polished  = False
+        polish_elapsed = 0.0
+
+        api_key = None if args.no_polish else load_together_api_key()
+        if api_key and raw_text:
+            if not silent:
+                info(f"Putze Transkript via {_c(BOLD, args.polish_model.split('/')[-1])} …")
+            _send_notification(
+                "Transcribrr",
+                f"Putze Transkript ({args.polish_model.split('/')[-1]}) …",
+                audio_path.name,
+            )
+            t0 = time.time()
+            try:
+                polished_text = polish_transcript(
+                    raw_text, api_key, args.polish_model)
+                polish_elapsed = time.time() - t0
+                if polished_text:
+                    full_text = polished_text
+                    polished  = True
+                    if not silent:
+                        delta = len(raw_text) - len(full_text)
+                        ok(f"Geputzt in {polish_elapsed:.1f}s  "
+                           f"{_c(DIM, f'({len(raw_text)} → {len(full_text)} Zeichen, Δ {delta:+d})')}")
+            except Exception as e:
+                polish_elapsed = time.time() - t0
+                warn(f"Polish fehlgeschlagen ({e}) — nutze Rohtext.")
+                _send_notification(
+                    "Transcribrr",
+                    f"Polish fehlgeschlagen — nutze Rohtext",
+                    str(e)[:80],
+                )
+
         # ── Clipboard ─────────────────────────────────────────────────
-        full_text = result["text"]
         if use_clipboard and full_text:
             subprocess.run("pbcopy", input=full_text.encode(), check=True)
             if not silent:
@@ -680,9 +802,11 @@ def main() -> None:
         # ── Fertig-Notification ───────────────────────────────────────
         if full_text:
             backend_label = "Lokal" if result["backend"] == "local-whisper" else "GCP"
+            polish_label  = " · geputzt" if polished else ""
             _send_notification(
                 "Transcribrr — Fertig",
-                f"In Zwischenablage · {result['confidence']:.0%} · {result['elapsed']:.1f}s",
+                f"In Zwischenablage · {result['confidence']:.0%} · "
+                f"{result['elapsed']:.1f}s{polish_label}",
                 f"{audio_path.name} · {backend_label}",
             )
         else:
@@ -711,6 +835,10 @@ def main() -> None:
                 out["model"]                       = args.model
                 out["effective_duration_seconds"]  = result.get("work_duration", duration)
                 out["silence_removed_seconds"]     = result.get("removed_secs", 0)
+            if polished:
+                out["transcript_raw"]      = raw_text
+                out["polish_model"]        = args.polish_model
+                out["polish_seconds"]      = polish_elapsed
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return
 
@@ -748,6 +876,12 @@ def main() -> None:
         else:
             row("Modell:", args.whisper_model.split("/")[-1])
         row("Sprache:", args.language)
+
+        if polished:
+            row("Polish:",
+                _c(GREEN, args.polish_model.split("/")[-1]) +
+                _c(DIM, f"  ({polish_elapsed:.1f}s, "
+                        f"{len(raw_text)} → {len(full_text)} Zeichen)"))
 
         if result["backend"].startswith("gcp"):
             cost = calc_cost(work_dur, args.model)
